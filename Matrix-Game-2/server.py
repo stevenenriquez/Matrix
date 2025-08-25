@@ -9,6 +9,9 @@ import queue
 import subprocess
 from typing import Optional, Tuple
 
+from collections import deque
+_LOGS = deque(maxlen=200)
+
 from fastapi import FastAPI, Request, Header
 from fastapi.responses import (
     HTMLResponse,
@@ -69,6 +72,7 @@ def _reader():
     for line in proc.stdout:
         s = line.rstrip()
         print("[MG2]", s, flush=True)
+        _LOGS.append(s)
 
         if "Please input the image path" in s and not _started:
             if proc.stdin:
@@ -314,3 +318,7 @@ def health():
     alive = (proc.poll() is None)
     cur = _current_mp4_path()
     return {"proc_alive": alive, "latest_mp4": cur, "output_dir": MG2_OUTPUT_DIR}
+
+@APP.get("/logs")
+def logs():
+    return JSONResponse({"lines": list(_LOGS)})
