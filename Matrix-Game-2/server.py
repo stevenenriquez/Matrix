@@ -1,144 +1,176 @@
 # server.py
-import os
-import sys
-import time
-import glob
-import io
-import threading
-import queue
-import subprocess
-from typing import Optional, Tuple
-
+import os, sys, time, glob, io, threading, queue, subprocess, pathlib, shutil
+from typing import Optional, Tuple, List
 from collections import deque
-_LOGS = deque(maxlen=200)
 
-from fastapi import FastAPI, Request, Header
-from fastapi.responses import (
-    HTMLResponse,
-    StreamingResponse,
-    JSONResponse,
-    PlainTextResponse,
-)
+from fastapi import FastAPI, Request, Header, Query, HTTPException
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, PlainTextResponse, Response
+from PIL import Image
 
 APP = FastAPI()
 
 # ---------------------------
 # Configuration (env vars)
 # ---------------------------
-MG2_IMG_PATH   = os.environ.get("MG2_IMG_PATH", "/workspace/Matrix/Matrix-Game-2/images/image.png")
-MG2_OUTPUT_DIR = os.environ.get("MG2_OUTPUT_DIR", "/workspace/Matrix/Matrix-Game-2/outputs/universal_run")
-MG2_REPO_DIR   = os.environ.get("MG2_REPO_DIR", "/workspace/Matrix/Matrix-Game-2")
-MG2_CONFIG     = os.environ.get("MG2_CONFIG", "configs/inference_yaml/inference_universal.yaml")
-MG2_CKPT       = os.environ.get("MG2_CKPT", "Matrix-Game-2.0/base_distilled_model/base_distill.safetensors")
-MG2_PRE        = os.environ.get("MG2_PRE", "Matrix-Game-2.0")
-MG2_SEED       = os.environ.get("MG2_SEED", "42")
+ROOT_DIR       = os.environ.get("MG2_REPO_DIR", "/workspace/Matrix/Matrix-Game-2")
+IMAGES_DIR     = os.environ.get("MG2_IMAGES_DIR", os.path.join(ROOT_DIR, "images"))
+OUTPUT_DIR     = os.environ.get("MG2_OUTPUT_DIR", os.path.join(ROOT_DIR, "outputs/universal_run"))
+CONFIG_PATH    = os.environ.get("MG2_CONFIG", "configs/inference_yaml/inference_universal.yaml")
+CKPT_PATH      = os.environ.get("MG2_CKPT", "Matrix-Game-2.0/base_distilled_model/base_distill.safetensors")
+PRETRAIN_DIR   = os.environ.get("MG2_PRE", "Matrix-Game-2.0")
+SEED           = os.environ.get("MG2_SEED", "42")
 
-os.makedirs(MG2_OUTPUT_DIR, exist_ok=True)
-
-# ---------------------------
-# Launch Matrix-Game-2.0
-# ---------------------------
-cmd = [
-    sys.executable, "-u", "inference_streaming.py",   # -u for unbuffered output
-    "--config_path", MG2_CONFIG,
-    "--checkpoint_path", MG2_CKPT,
-    "--output_folder", MG2_OUTPUT_DIR,
-    "--seed", MG2_SEED,
-    "--pretrained_model_path", MG2_PRE,
-]
-
-proc = subprocess.Popen(
-    cmd,
-    cwd=MG2_REPO_DIR,
-    stdin=subprocess.PIPE,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.STDOUT,
-    bufsize=1,
-    universal_newlines=True,
-)
+# Create output dir if missing
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+# Sanity: absolute, normalized paths
+ROOT_DIR   = str(pathlib.Path(ROOT_DIR).resolve())
+IMAGES_DIR = str(pathlib.Path(IMAGES_DIR).resolve())
+OUTPUT_DIR = str(pathlib.Path(OUTPUT_DIR).resolve())
 
 # ---------------------------
-# CLI prompt synchronization
+# Subprocess & I/O sync state
 # ---------------------------
+proc: Optional[subprocess.Popen] = None
+proc_lock = threading.Lock()
+
+# queues / flags
 _in_q: "queue.Queue[Tuple[str, str] | str]" = queue.Queue()
 _ready_mouse = False
-_ready_move = False
-_started = False
-_lock = threading.Lock()
+_ready_move  = False
+_started     = False
+io_lock = threading.Lock()
 
-def _reader():
-    """Read MG2 stdout, detect prompts, answer image path once."""
+# logs buffer
+_LOGS = deque(maxlen=400)
+
+# current image in use
+_current_image_path = os.environ.get("MG2_IMG_PATH", os.path.join(IMAGES_DIR, "image.png"))
+
+def _within(base: str, path: str) -> bool:
+    base = str(pathlib.Path(base).resolve())
+    path = str(pathlib.Path(path).resolve())
+    return os.path.commonpath([base]) == os.path.commonpath([base, path])
+
+def _build_cmd(img_path: str) -> List[str]:
+    return [
+        sys.executable, "-u", "inference_streaming.py",
+        "--config_path", CONFIG_PATH,
+        "--checkpoint_path", CKPT_PATH,
+        "--output_folder", OUTPUT_DIR,
+        "--seed", SEED,
+        "--pretrained_model_path", PRETRAIN_DIR,
+        "--img_path", img_path,  # avoid prompt
+    ]
+
+def _reader_thread(p: subprocess.Popen):
     global _ready_mouse, _ready_move, _started
-    for line in proc.stdout:
+    _started = False
+    for line in p.stdout:
         s = line.rstrip()
-        print("[MG2]", s, flush=True)
         _LOGS.append(s)
-
-        if "Please input the image path" in s and not _started:
-            if proc.stdin:
-                proc.stdin.write(MG2_IMG_PATH + "\n")
-                proc.stdin.flush()
-            _started = True
-
-        elif "Please input the mouse action" in s:
-            with _lock:
+        print("[MG2]", s, flush=True)
+        if "Please input the mouse action" in s:
+            with io_lock:
                 _ready_mouse = True
-                _ready_move = False
-
-        # Some versions explicitly ask for movement; others imply it after mouse.
+                _ready_move  = False
         elif "movement action" in s or "PRESS [W, S, A, D, Q]" in s:
-            with _lock:
+            with io_lock:
                 _ready_move = True
 
-def _writer():
-    """Send (mouse, move) pairs to the process in sync with prompts."""
+def _writer_thread(p: subprocess.Popen):
     global _ready_mouse, _ready_move
     while True:
         item = _in_q.get()
         if item == "STOP":
             break
         mouse, move = item
-
         # wait for mouse prompt
         while True:
-            with _lock:
+            with io_lock:
                 if _ready_mouse:
                     break
             time.sleep(0.01)
-
-        if proc.stdin:
-            proc.stdin.write((mouse or "U") + "\n")
-            proc.stdin.flush()
-
-        with _lock:
+        if p.stdin:
+            p.stdin.write((mouse or "U") + "\n"); p.stdin.flush()
+        with io_lock:
             _ready_mouse = False
-            _ready_move = True
-
+            _ready_move  = True
         # wait for move prompt
         while True:
-            with _lock:
+            with io_lock:
                 if _ready_move:
                     break
             time.sleep(0.01)
-
-        if proc.stdin:
-            proc.stdin.write((move or "Q") + "\n")
-            proc.stdin.flush()
-
-        with _lock:
+        if p.stdin:
+            p.stdin.write((move or "Q") + "\n"); p.stdin.flush()
+        with io_lock:
             _ready_move = False
 
-threading.Thread(target=_reader, daemon=True).start()
-threading.Thread(target=_writer, daemon=True).start()
+reader_t: Optional[threading.Thread] = None
+writer_t: Optional[threading.Thread] = None
+
+def _stop_proc():
+    global proc, reader_t, writer_t, _ready_mouse, _ready_move
+    with proc_lock:
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        proc = None
+    # reset flags/queue
+    with io_lock:
+        _ready_mouse = False
+        _ready_move  = False
+    while not _in_q.empty():
+        try: _in_q.get_nowait()
+        except Exception: break
+
+def _start_proc(img_path: str):
+    global proc, reader_t, writer_t, _current_image_path
+    if not _within(IMAGES_DIR, img_path):
+        raise RuntimeError("Image must be inside IMAGES_DIR")
+
+    cmd = _build_cmd(img_path)
+    with proc_lock:
+        p = subprocess.Popen(
+            cmd, cwd=ROOT_DIR,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            bufsize=1, universal_newlines=True,
+        )
+        proc = p
+    _current_image_path = img_path
+
+    # spawn fresh I/O threads bound to this proc
+    def spawn_reader():
+        _reader_thread(p)
+    def spawn_writer():
+        _writer_thread(p)
+    rt = threading.Thread(target=spawn_reader, daemon=True)
+    wt = threading.Thread(target=spawn_writer, daemon=True)
+    rt.start(); wt.start()
+    # record handles
+    globals()['reader_t'] = rt
+    globals()['writer_t'] = wt
+
+# start initially
+if os.path.exists(_current_image_path):
+    _start_proc(_current_image_path)
+else:
+    _LOGS.append(f"Initial image not found: {_current_image_path}")
 
 # ---------------------------
-# Find/serve the latest mp4
+# Helpers for mp4 serving
 # ---------------------------
 def _latest_mp4() -> Optional[str]:
-    # Prefer *_current.mp4; fall back to any .mp4 under output dir
-    mp4s = glob.glob(os.path.join(MG2_OUTPUT_DIR, "**", "*_current.mp4"), recursive=True)
+    # Prefer *_current.mp4; fallback to any mp4
+    mp4s = glob.glob(os.path.join(OUTPUT_DIR, "**", "*_current.mp4"), recursive=True)
     if not mp4s:
-        mp4s = glob.glob(os.path.join(MG2_OUTPUT_DIR, "**", "*.mp4"), recursive=True)
+        mp4s = glob.glob(os.path.join(OUTPUT_DIR, "**", "*.mp4"), recursive=True)
     if not mp4s:
         return None
     mp4s.sort(key=lambda p: os.path.getmtime(p))
@@ -147,9 +179,235 @@ def _latest_mp4() -> Optional[str]:
 def _current_mp4_path() -> Optional[str]:
     return _latest_mp4()
 
-@APP.get("/meta")
-def meta():
-    """Return mtime/size so the client knows when to reload the video."""
+# ---------------------------
+# UI (index) with gallery
+# ---------------------------
+INDEX_HTML = f"""
+<!doctype html>
+<title>Matrix-Game 2.0 — Live Control</title>
+<style>
+  body{{font-family:system-ui,sans-serif;margin:1rem}}
+  .row{{display:flex;gap:.5rem;margin:.5rem 0;flex-wrap:wrap;align-items:center}}
+  button{{padding:.5rem .75rem;font-size:1rem}}
+  video{{max-width:100%;border:1px solid #ccc;border-radius:8px}}
+  img.thumb{{width:144px;height:96px;object-fit:cover;border-radius:8px;border:1px solid #ccc;cursor:pointer}}
+  .muted{{color:#666;font-size:.9rem}}
+  .grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(156px,1fr));gap:.75rem}}
+  .card{{display:flex;flex-direction:column;gap:.25rem;align-items:center}}
+  .sel{{border:2px solid #0a84ff !important}}
+</style>
+
+<h1>Matrix-Game 2.0 — Live Control</h1>
+
+<div class="row muted"><strong>Keys:</strong> Mouse: I K J L U &nbsp;|&nbsp; Move: W A S D Q</div>
+
+<div class="row">
+  <label>Mouse:</label>
+  <select id="mouse"><option>U</option><option>I</option><option>K</option><option>J</option><option>L</option></select>
+  <label>Move:</label>
+  <select id="move"><option>Q</option><option>W</option><option>A</option><option>S</option><option>D</option></select>
+  <button onclick="sendCmd()">Send</button>
+  <button onclick="restart()">Restart</button>
+  <span class="muted" id="sel"></span>
+</div>
+
+<h3>Images</h3>
+<div id="gallery" class="grid"></div>
+
+<h3>Clip</h3>
+<video id="vid" controls autoplay playsinline muted></video>
+<div class="row muted" id="status"></div>
+
+<script>
+const vid = document.getElementById('vid');
+const statusEl = document.getElementById('status');
+const gallery = document.getElementById('gallery');
+const sel = document.getElementById('sel');
+let lastTag = null;
+let currentImg = null;
+
+async function sendCmd(){{
+  const mouse=document.getElementById('mouse').value;
+  const move=document.getElementById('move').value;
+  await fetch('/cmd',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{mouse,move}})}});
+}}
+
+async function restart(imgPath){{
+  // If imgPath omitted, reuse current
+  const body = imgPath ? {{img: imgPath, purge:true}} : {{purge:false}};
+  const r = await fetch('/restart',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}});
+  const j = await r.json();
+  if(j.ok){{
+    currentImg = j.image;
+    updateSel();
+    lastTag = null; // force video reload on next /meta tick
+  }}
+}}
+
+function updateSel(){{
+  sel.textContent = currentImg ? ('Selected: ' + currentImg) : '';
+  document.querySelectorAll('.thumb').forEach(el=>{{
+    if(currentImg && el.getAttribute('data-name')===currentImg) el.classList.add('sel');
+    else el.classList.remove('sel');
+  }});
+}}
+
+async function loadImages(){{
+  const r = await fetch('/images');
+  const j = await r.json();
+  gallery.innerHTML = '';
+  j.items.forEach(it => {{
+    const card = document.createElement('div');
+    card.className = 'card';
+    const img = document.createElement('img');
+    img.className = 'thumb';
+    img.src = it.thumb;
+    img.title = it.name;
+    img.setAttribute('data-name', it.name);
+    img.onclick = () => restart(it.path);
+    const cap = document.createElement('div');
+    cap.className = 'muted';
+    cap.textContent = it.name;
+    card.appendChild(img); card.appendChild(cap);
+    gallery.appendChild(card);
+  }});
+  currentImg = j.selected || null;
+  updateSel();
+}}
+
+// Poll for new 1s clip; reload <video> when mtime/size changes
+async function refreshIfChanged(){{
+  try{{
+    const r = await fetch('/meta');
+    const j = await r.json();
+    if(!j.exists){{ statusEl.textContent='Waiting for first clip…'; return; }}
+    const tag = `${{j.mtime}}-${{j.size}}`;
+    statusEl.textContent = `Current: ${{j.path}}  |  size: ${{j.size}}  |  mtime: ${{new Date(j.mtime*1000).toLocaleTimeString()}}`;
+    if(tag !== lastTag){{
+      lastTag = tag;
+      const url = `/current.mp4?t=${{encodeURIComponent(tag)}}`;
+      const wasPaused = vid.paused;
+      vid.src = url;
+      await vid.play().catch(()=>{});
+      if (wasPaused) vid.pause();
+    }}
+  }}catch(e){{}}
+}}
+
+setInterval(refreshIfChanged, 250);
+refreshIfChanged();
+loadImages();
+</script>
+"""
+
+# ---------------------------
+# Routes
+# ---------------------------
+@APP.get("/", response_class=HTMLResponse)
+def index():
+    return INDEX_HTML
+
+@APP.get("/favicon.ico")
+def favicon():
+    return PlainTextResponse("", status_code=204)
+
+@APP.get("/healthz")
+def health():
+    with proc_lock:
+        alive = (proc is not None and proc.poll() is None)
+    cur = _current_mp4_path()
+    return {"proc_alive": alive, "latest_mp4": cur, "output_dir": OUTPUT_DIR, "image": _current_image_path}
+
+@APP.get("/logs")
+def logs():
+    return JSONResponse({"lines": list(_LOGS)})
+
+# --- Images listing and thumbnails ---
+def _list_images() -> List[str]:
+    pats = ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp"]
+    files: List[str] = []
+    for pat in pats:
+        files += glob.glob(os.path.join(IMAGES_DIR, pat))
+    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return files
+
+@APP.get("/images")
+def images():
+    items = []
+    for p in _list_images():
+        name = os.path.basename(p)
+        items.append({
+            "name": name,
+            "path": str(pathlib.Path(p).resolve()),
+            "thumb": f"/thumb?name={name}",
+            "url": f"/image?name={name}"
+        })
+    sel = os.path.basename(_current_image_path) if _within(IMAGES_DIR, _current_image_path) else None
+    return {"items": items, "selected": sel, "dir": IMAGES_DIR}
+
+@APP.get("/image")
+def image(name: str = Query(...)):
+    path = str(pathlib.Path(IMAGES_DIR, name).resolve())
+    if not _within(IMAGES_DIR, path) or not os.path.exists(path):
+        raise HTTPException(404)
+    with open(path, "rb") as f:
+        data = f.read()
+    # naive content-type; browser only needs it for viewing
+    return Response(content=data, media_type="image/*", headers={"Cache-Control": "no-store"})
+
+@APP.get("/thumb")
+def thumb(name: str = Query(...), w: int = 256, h: int = 160):
+    path = str(pathlib.Path(IMAGES_DIR, name).resolve())
+    if not _within(IMAGES_DIR, path) or not os.path.exists(path):
+        raise HTTPException(404)
+    try:
+        img = Image.open(path).convert("RGB")
+        img.thumbnail((w, h))
+        bio = io.BytesIO()
+        img.save(bio, format="JPEG", quality=85, optimize=True)
+        return Response(content=bio.getvalue(), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+    except Exception:
+        raise HTTPException(500)
+
+# --- Restart with (optional) new image ---
+@APP.post("/restart")
+async def restart(req: Request):
+    body = await req.json()
+    img = body.get("img")  # absolute path (from /images), or None to reuse current
+    purge = bool(body.get("purge", False))
+
+    global _current_image_path
+    if img:
+        # validate
+        if not _within(IMAGES_DIR, img) or not os.path.exists(img):
+            raise HTTPException(400, "Image must be inside IMAGES_DIR")
+        _current_image_path = img
+
+    # purge outputs if requested
+    if purge and os.path.exists(OUTPUT_DIR):
+        for p in glob.glob(os.path.join(OUTPUT_DIR, "*")):
+            try:
+                if os.path.isdir(p): shutil.rmtree(p)
+                else: os.remove(p)
+            except Exception:
+                pass
+
+    # stop & start
+    _stop_proc()
+    _start_proc(_current_image_path)
+    return JSONResponse({"ok": True, "image": os.path.basename(_current_image_path)})
+
+# --- Control commands ---
+@APP.post("/cmd")
+async def cmd_endpoint(req: Request):
+    data = await req.json()
+    mouse = (data.get("mouse") or "U").upper()[0]
+    move  = (data.get("move")  or "Q").upper()[0]
+    _in_q.put((mouse, move))
+    return JSONResponse({"ok": True, "mouse": mouse, "move": move})
+
+# --- MP4 metadata & streaming with HTTP Range ---
+def _meta_payload():
     p = _current_mp4_path()
     if not p or not os.path.exists(p):
         return {"exists": False}
@@ -160,16 +418,14 @@ def meta():
         "size": os.path.getsize(p),
     }
 
+@APP.get("/meta")
+def meta():
+    return _meta_payload()
+
 @APP.get("/current.mp4")
 def current_mp4(range: str | None = Header(default=None)):
-    """
-    Serve the entire latest *_current.mp4 with HTTP Range support,
-    so <video> can stream/seek. When MG2 overwrites the file, the
-    /meta mtime changes and the page reloads the src.
-    """
     path = _current_mp4_path()
     if not path or not os.path.exists(path):
-        # Empty stream placeholder (no file yet)
         return StreamingResponse(iter(()), media_type="video/mp4",
                                  headers={"Cache-Control": "no-store"})
 
@@ -184,8 +440,7 @@ def current_mp4(range: str | None = Header(default=None)):
             end = int(parts[1]) if len(parts) > 1 and parts[1] else end
         except Exception:
             start, end = 0, file_size - 1
-        start = max(0, start)
-        end = min(end, file_size - 1)
+        start = max(0, start); end = min(end, file_size - 1)
 
     def _read():
         with open(path, "rb") as f:
@@ -194,8 +449,7 @@ def current_mp4(range: str | None = Header(default=None)):
             chunk = 1024 * 1024
             while remaining > 0:
                 data = f.read(min(chunk, remaining))
-                if not data:
-                    break
+                if not data: break
                 remaining -= len(data)
                 yield data
 
@@ -208,117 +462,3 @@ def current_mp4(range: str | None = Header(default=None)):
     }
     status = 206 if range else 200
     return StreamingResponse(_read(), status_code=status, headers=headers)
-
-# ---------------------------
-# Control UI + endpoints
-# ---------------------------
-INDEX_HTML = """
-<!doctype html>
-<title>Matrix-Game 2.0 — Live Control</title>
-<style>
-  body{font-family:system-ui,sans-serif;margin:1rem}
-  .row{display:flex;gap:.5rem;margin:.5rem 0;flex-wrap:wrap}
-  button{padding:.5rem .75rem;font-size:1rem}
-  video{max-width:100%;border:1px solid #ccc;border-radius:8px}
-  label{margin-right:.25rem}
-  select{padding:.25rem .5rem}
-  .muted{color:#666;font-size:.9rem}
-</style>
-<h1>Matrix-Game 2.0 — Live Control</h1>
-<div class="row muted"><strong>Keys:</strong> Mouse: I K J L U &nbsp;|&nbsp; Move: W A S D Q</div>
-<div class="row">
-  <label>Mouse:</label>
-  <select id="mouse"><option>U</option><option>I</option><option>K</option><option>J</option><option>L</option></select>
-  <label>Move:</label>
-  <select id="move"><option>Q</option><option>W</option><option>A</option><option>S</option><option>D</option></select>
-  <button onclick="sendCmd()">Send</button>
-</div>
-<div class="row">
-  <button onclick="quick('U','W')">U+W</button>
-  <button onclick="quick('U','S')">U+S</button>
-  <button onclick="quick('U','A')">U+A</button>
-  <button onclick="quick('U','D')">U+D</button>
-  <button onclick="quick('I','Q')">I+Q</button>
-  <button onclick="quick('K','Q')">K+Q</button>
-  <button onclick="quick('J','Q')">J+Q</button>
-  <button onclick="quick('L','Q')">L+Q</button>
-</div>
-
-<video id="vid" controls autoplay playsinline muted></video>
-<div class="row muted" id="status"></div>
-
-<script>
-const vid = document.getElementById('vid');
-const statusEl = document.getElementById('status');
-
-async function sendCmd(){
-  const mouse=document.getElementById('mouse').value;
-  const move=document.getElementById('move').value;
-  await fetch('/cmd',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mouse,move})});
-}
-
-async function quick(m,v){
-  await fetch('/cmd',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mouse:m,move:v})});
-}
-
-// Keyboard shortcuts
-document.addEventListener('keydown', async (e)=>{
-  const k=e.key.toLowerCase();
-  const move={'w':'W','a':'A','s':'S','d':'D','q':'Q'}[k];
-  const cam ={'i':'I','k':'K','j':'J','l':'L','u':'U'}[k];
-  if(move){ await quick('U',move); }
-  if(cam){  await quick(cam,'Q'); }
-});
-
-// Poll for new 1s clip; reload <video> when mtime/size changes
-let lastTag = null;
-async function refreshIfChanged(){
-  try{
-    const r = await fetch('/meta');
-    const j = await r.json();
-    if(!j.exists){ statusEl.textContent='Waiting for first clip…'; return; }
-    const tag = `${j.mtime}-${j.size}`;
-    statusEl.textContent = `Current: ${j.path}  |  size: ${j.size}  |  mtime: ${new Date(j.mtime*1000).toLocaleTimeString()}`;
-    if(tag !== lastTag){
-      lastTag = tag;
-      const url = `/current.mp4?t=${encodeURIComponent(tag)}`;
-      const wasPaused = vid.paused;
-      vid.src = url;                       // reload full clip
-      await vid.play().catch(()=>{});
-      if (wasPaused) vid.pause();
-    }
-  }catch(e){
-    // ignore transient errors
-  }
-}
-setInterval(refreshIfChanged, 250);
-refreshIfChanged();
-</script>
-"""
-
-@APP.get("/", response_class=HTMLResponse)
-def index():
-    return INDEX_HTML
-
-@APP.post("/cmd")
-async def cmd_endpoint(req: Request):
-    data = await req.json()
-    mouse = (data.get("mouse") or "U").upper()[0]
-    move  = (data.get("move")  or "Q").upper()[0]
-    # Enqueue the pair; writer thread syncs with prompts
-    _in_q.put((mouse, move))
-    return JSONResponse({"ok": True, "mouse": mouse, "move": move})
-
-@APP.get("/favicon.ico")
-def favicon():
-    return PlainTextResponse("", status_code=204)
-
-@APP.get("/healthz")
-def health():
-    alive = (proc.poll() is None)
-    cur = _current_mp4_path()
-    return {"proc_alive": alive, "latest_mp4": cur, "output_dir": MG2_OUTPUT_DIR}
-
-@APP.get("/logs")
-def logs():
-    return JSONResponse({"lines": list(_LOGS)})
