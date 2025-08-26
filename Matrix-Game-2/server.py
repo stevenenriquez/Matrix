@@ -86,8 +86,7 @@ def _build_cmd(img_path: str) -> List[str]:
 def _send_line(p: subprocess.Popen, text: str):
     if p.stdin:
         try:
-            p.stdin.write(text + "
-")
+            p.stdin.write(text + "")
             p.stdin.flush()
         except BrokenPipeError:
             _LOGS.append("[server] stdin broken pipe while sending line")
