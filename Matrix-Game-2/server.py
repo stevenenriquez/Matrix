@@ -77,8 +77,7 @@ def _build_cmd(img_path: str) -> List[str]:
 
 def _send_line(p: subprocess.Popen, text: str):
     if p.stdin:
-        p.stdin.write(text + "
-")
+        p.stdin.write(text + "")
         p.stdin.flush()
         _LOGS.append(f"[server→child] {text}")
         print("[server→child]", text, flush=True)
@@ -250,117 +249,286 @@ INDEX_HTML = """
 <!doctype html>
 <title>Matrix-Game 2.0 — Live Control</title>
 <style>
-  body{font-family:system-ui,sans-serif;margin:1rem}
-  .row{display:flex;gap:.5rem;margin:.5rem 0;flex-wrap:wrap;align-items:center}
-  button{padding:.5rem .75rem;font-size:1rem}
-  video{max-width:100%;border:1px solid #ccc;border-radius:8px}
-  img.thumb{width:144px;height:96px;object-fit:cover;border-radius:8px;border:1px solid #ccc;cursor:pointer}
-  .muted{color:#666;font-size:.9rem}
-  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(156px,1fr));gap:.75rem}
-  .card{display:flex;flex-direction:column;gap:.25rem;align-items:center}
-  .sel{border:2px solid #0a84ff !important}
+    :root{
+        --bg:#0b0d10; --panel:#11151a; --panel2:#151a21; --text:#e6edf3; --muted:#9aa7b2;
+        --accent:#3ea6ff; --accent2:#00d1b2; --border:#222a33; --key:#1c222b; --keyText:#e6edf3;
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial;background:radial-gradient(1200px 800px at 50% -20%, #1a2330 0%, #0b0d10 60%);color:var(--text)}
+    a{color:var(--accent)}
+
+    .wrap{min-height:100%;display:flex;flex-direction:column}
+    header{padding:16px 24px;border-bottom:1px solid var(--border);background:linear-gradient(180deg, rgba(255,255,255,0.02), transparent)}
+    header .title{display:flex;gap:12px;align-items:center}
+    .badge{font-size:12px;padding:3px 8px;border:1px solid var(--border);border-radius:999px;color:var(--muted);background:rgba(0,0,0,.25)}
+
+    main{padding:20px}
+    .layout{display:grid;grid-template-columns:1fr;gap:18px;max-width:1400px;margin:0 auto}
+    @media (min-width: 1200px){ .layout{grid-template-columns:2fr 1fr} }
+
+    /* Player */
+    .player-card{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.35)}
+    .player{position:relative;aspect-ratio:16/9;border-radius:12px;overflow:hidden;background:linear-gradient(180deg, #0d1117, #0b0d10)}
+    .player video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:#000}
+    .player img.preview{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000;display:none}
+    .player .overlay{position:absolute;inset:0;display:flex;align-items:end;justify-content:space-between;padding:12px;background:linear-gradient( to top, rgba(0,0,0,.45), rgba(0,0,0,0) 40%);pointer-events:none}
+    .status{font-size:12px;color:var(--muted)}
+
+    /* Controls */
+    .controls-card{background:var(--panel2);border:1px solid var(--border);border-radius:16px;padding:16px;display:flex;flex-direction:column;gap:16px}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    .spacer{flex:1}
+    button.primary{background:var(--accent);color:#071018;border:none;border-radius:10px;padding:10px 14px;font-weight:600;cursor:pointer}
+    button.ghost{background:transparent;color:var(--text);border:1px solid var(--border);border-radius:10px;padding:10px 14px;cursor:pointer}
+    button.primary:hover{filter:brightness(1.05)}
+    button.ghost:hover{border-color:#334153}
+
+    .keypad{display:flex;gap:22px;flex-wrap:wrap}
+    .pad{display:grid;grid-template-columns:repeat(3,56px);grid-auto-rows:56px;gap:8px;align-items:center;justify-content:center;background:linear-gradient(180deg, rgba(255,255,255,.03), rgba(255,255,255,.01));border:1px solid var(--border);border-radius:14px;padding:12px}
+    .pad-title{grid-column:1/-1;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;justify-self:start}
+    .key{display:flex;align-items:center;justify-content:center;border-radius:10px;background:var(--key);color:var(--keyText);box-shadow:inset 0 1px 0 rgba(255,255,255,.04), 0 4px 14px rgba(0,0,0,.35);border:1px solid #28303a;cursor:pointer;user-select:none;font-weight:700}
+    .key.small{font-size:12px}
+    .key:active{transform:translateY(1px)}
+    .hint{font-size:12px;color:var(--muted)}
+
+    /* Gallery */
+    .gallery-card{background:var(--panel2);border:1px solid var(--border);border-radius:16px;padding:16px}
+    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px}
+    .thumb-wrap{position:relative;border-radius:12px;overflow:hidden;border:1px solid var(--border);background:#0b0f14}
+    img.thumb{width:100%;height:110px;object-fit:cover;display:block;opacity:.95;transition:opacity .15s ease, transform .15s ease}
+    .thumb-wrap:hover img.thumb{opacity:1;transform:scale(1.01)}
+    .thumb-name{font-size:12px;color:var(--muted);margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .sel{outline:2px solid var(--accent)}
+
+    /* Hidden native selectors, kept for fallback */
+    .native-selects{display:none}
+    @media (prefers-reduced-motion:no-preference){ .pulse{animation:pulse 1.2s ease-in-out infinite} }
+    @keyframes pulse{0%{opacity:.6}50%{opacity:1}100%{opacity:.6}}
 </style>
 
-<h1>Matrix-Game 2.0 — Live Control</h1>
+<div class="wrap">
+    <header>
+        <div class="title">
+            <h2 style="margin:0">Matrix-Game 2.0 — Live Control</h2>
+            <span class="badge">Streaming</span>
+        </div>
+    </header>
 
-<div class="row muted"><strong>Keys:</strong> Mouse: I K J L U &nbsp;|&nbsp; Move: W A S D Q</div>
+    <main>
+        <div class="layout">
+            <section class="player-card">
+                <div class="player" id="player">
+                    <video id="vid" controls autoplay playsinline muted></video>
+                    <img id="preview" class="preview" alt="Selected image preview" />
+                    <div class="overlay">
+                        <div class="status" id="status">Initializing…</div>
+                        <div class="status">Tip: Use the on-screen pads or your keyboard</div>
+                    </div>
+                </div>
+            </section>
 
-<div class="row">
-  <label>Mouse:</label>
-  <select id="mouse"><option>U</option><option>I</option><option>K</option><option>J</option><option>L</option></select>
-  <label>Move:</label>
-  <select id="move"><option>Q</option><option>W</option><option>A</option><option>S</option><option>D</option></select>
-  <button onclick="sendCmd()">Send</button>
-  <button onclick="restart()">Restart</button>
-  <span class="muted" id="sel"></span>
+            <aside class="controls-card">
+                <div class="row">
+                    <div class="hint">Select an image below, then use the pads to look and move.</div>
+                    <div class="spacer"></div>
+                    <button class="ghost" onclick="restart()">Restart</button>
+                </div>
+
+                <div class="keypad">
+                    <div class="pad" id="lookPad">
+                        <div class="pad-title">Look</div>
+                        <div></div>
+                        <div class="key" data-m="I" data-v="Q">I</div>
+                        <div></div>
+                        <div class="key" data-m="J" data-v="Q">J</div>
+                        <div class="key small" data-m="U" data-v="Q" title="No look">•</div>
+                        <div class="key" data-m="L" data-v="Q">L</div>
+                        <div></div>
+                        <div class="key" data-m="K" data-v="Q">K</div>
+                        <div></div>
+                    </div>
+
+                    <div class="pad" id="movePad">
+                        <div class="pad-title">Move</div>
+                        <div></div>
+                        <div class="key" data-m="U" data-v="W">W</div>
+                        <div></div>
+                        <div class="key" data-m="U" data-v="A">A</div>
+                        <div class="key" data-m="U" data-v="Q" title="Stop">■</div>
+                        <div class="key" data-m="U" data-v="D">D</div>
+                        <div></div>
+                        <div class="key" data-m="U" data-v="S">S</div>
+                        <div></div>
+                    </div>
+                </div>
+
+                <div class="row native-selects">
+                    <label>Mouse:</label>
+                    <select id="mouse"><option>U</option><option>I</option><option>K</option><option>J</option><option>L</option></select>
+                    <label>Move:</label>
+                    <select id="move"><option>Q</option><option>W</option><option>A</option><option>S</option><option>D</option></select>
+                    <button class="primary" onclick="sendCmd()">Send</button>
+                </div>
+
+                <div class="row"><span id="sel" class="hint"></span></div>
+            </aside>
+        </div>
+
+        <section class="gallery-card">
+            <h3 style="margin:0 0 10px 0">Images</h3>
+            <div id="gallery" class="grid"></div>
+        </section>
+    </main>
 </div>
-
-<h3>Images</h3>
-<div id="gallery" class="grid"></div>
-
-<h3>Clip</h3>
-<video id="vid" controls autoplay playsinline muted></video>
-<div class="row muted" id="status"></div>
 
 <script>
 const vid = document.getElementById('vid');
+const previewImg = document.getElementById('preview');
 const statusEl = document.getElementById('status');
 const gallery = document.getElementById('gallery');
 const sel = document.getElementById('sel');
 let lastTag = null;
 let currentImg = null;
+let activityStarted = false; // true once user looks or moves
+
+// Lightweight helpers
+function showPreview(url){
+    previewImg.src = url;
+    previewImg.style.display = 'block';
+    vid.poster = url;
+}
+function hidePreview(){
+    previewImg.style.display = 'none';
+}
+
+async function send(mouse, move){
+    await fetch('/cmd',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mouse,move})});
+}
 
 async function sendCmd(){
-  const mouse=document.getElementById('mouse').value;
-  const move=document.getElementById('move').value;
-  await fetch('/cmd',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mouse,move})});
+    const mouse=document.getElementById('mouse').value;
+    const move=document.getElementById('move').value;
+    if(mouse!=='U' || move!=='Q') activityStarted = true;
+    await send(mouse, move);
 }
 
 async function restart(imgPath){
-  // If imgPath omitted, reuse current
-  const body = imgPath ? {img: imgPath, purge:true} : {purge:false};
-  const r = await fetch('/restart',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  const j = await r.json();
-  if(j.ok){
-    currentImg = j.image;
-    updateSel();
-    lastTag = null; // force video reload on next /meta tick
-  }
+    // If imgPath omitted, reuse current
+    const body = imgPath ? {img: imgPath, purge:true} : {purge:false};
+    const r = await fetch('/restart',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const j = await r.json();
+    if(j.ok){
+        currentImg = j.image;
+        updateSel();
+        // show the selected image as preview until activity starts and video is ready
+        const url = `/image?name=${encodeURIComponent(currentImg)}`;
+        showPreview(url);
+        lastTag = null; // force video reload on next /meta tick
+        activityStarted = false;
+    }
 }
 
 function updateSel(){
-  sel.textContent = currentImg ? ('Selected: ' + currentImg) : '';
-  document.querySelectorAll('.thumb').forEach(el=>{
-    if(currentImg && el.getAttribute('data-name')===currentImg) el.classList.add('sel');
-    else el.classList.remove('sel');
-  });
+    sel.textContent = currentImg ? ('Selected: ' + currentImg) : '';
+    document.querySelectorAll('.thumb').forEach(el=>{
+        if(currentImg && el.getAttribute('data-name')===currentImg) el.classList.add('sel');
+        else el.classList.remove('sel');
+    });
 }
 
 async function loadImages(){
-  const r = await fetch('/images');
-  const j = await r.json();
-  gallery.innerHTML = '';
-  j.items.forEach(it => {
-    const card = document.createElement('div');
-    card.className = 'card';
-    const img = document.createElement('img');
-    img.className = 'thumb';
-    img.src = it.thumb;
-    img.title = it.name;
-    img.setAttribute('data-name', it.name);
-    img.onclick = () => restart(it.path);
-    const cap = document.createElement('div');
-    cap.className = 'muted';
-    cap.textContent = it.name;
-    card.appendChild(img); card.appendChild(cap);
-    gallery.appendChild(card);
-  });
-  currentImg = j.selected || null;
-  updateSel();
+    const r = await fetch('/images');
+    const j = await r.json();
+    gallery.innerHTML = '';
+    j.items.forEach(it => {
+        const wrap = document.createElement('div');
+        wrap.className = 'thumb-wrap';
+        const img = document.createElement('img');
+        img.className = 'thumb';
+        img.src = it.thumb;
+        img.title = it.name;
+        img.setAttribute('data-name', it.name);
+        img.onclick = () => restart(it.path);
+        wrap.appendChild(img);
+        const cap = document.createElement('div');
+        cap.className = 'thumb-name';
+        cap.textContent = it.name;
+        const cont = document.createElement('div');
+        cont.appendChild(wrap); cont.appendChild(cap);
+        gallery.appendChild(cont);
+    });
+    currentImg = j.selected || null;
+    updateSel();
+    if(currentImg){
+        const url = `/image?name=${encodeURIComponent(currentImg)}`;
+        showPreview(url);
+    }
 }
+
+// Wire gamepad clicks
+function setupPads(){
+    document.querySelectorAll('.pad .key').forEach(k=>{
+        k.addEventListener('click', async ()=>{
+            const m = k.getAttribute('data-m') || 'U';
+            const v = k.getAttribute('data-v') || 'Q';
+            if(m!=='U' || v!=='Q') activityStarted = true;
+            await send(m, v);
+        });
+    });
+}
+
+// Optional keyboard support (IJKLU, WASDQ)
+const keyMap = {
+    'i': ['I','Q'], 'k': ['K','Q'], 'j': ['J','Q'], 'l': ['L','Q'], 'u': ['U','Q'],
+    'w': ['U','W'], 'a': ['U','A'], 's': ['U','S'], 'd': ['U','D'], 'q': ['U','Q']
+};
+window.addEventListener('keydown', async (ev)=>{
+    const k = ev.key.toLowerCase();
+    if(keyMap[k]){
+        ev.preventDefault();
+        const [m,v] = keyMap[k];
+        if(m!=='U' || v!=='Q') activityStarted = true;
+        await send(m,v);
+    }
+});
+
+// Handle video state and auto-switch from preview when stream updates
+vid.addEventListener('playing', ()=>{
+    if(activityStarted) hidePreview();
+});
+vid.addEventListener('loadeddata', ()=>{
+    // In case autoplay is blocked, still hide preview once loaded and activity started
+    if(activityStarted && !vid.paused) hidePreview();
+});
 
 // Poll for new 1s clip; reload <video> when mtime/size changes
 async function refreshIfChanged(){
-  try{
-    const r = await fetch('/meta');
-    const j = await r.json();
-    if(!j.exists){ statusEl.textContent='Waiting for first clip…'; return; }
-    const tag = `${j.mtime}-${j.size}`;
-    statusEl.textContent = `Current: ${j.path}  |  size: ${j.size}  |  mtime: ${new Date(j.mtime*1000).toLocaleTimeString()}`;
-    if(tag !== lastTag){
-      lastTag = tag;
-      const url = `/current.mp4?t=${encodeURIComponent(tag)}`;
-      const wasPaused = vid.paused;
-      vid.src = url;
-      await vid.play().catch(()=>{});
-      if (wasPaused) vid.pause();
-    }
-  }catch(e){}
+    try{
+        const r = await fetch('/meta');
+        const j = await r.json();
+        if(!j.exists){ statusEl.textContent='Waiting for first clip…'; return; }
+        const tag = `${j.mtime}-${j.size}`;
+        statusEl.textContent = `Current: ${j.path}  |  size: ${j.size}  |  mtime: ${new Date(j.mtime*1000).toLocaleTimeString()}`;
+        if(tag !== lastTag){
+            lastTag = tag;
+            const url = `/current.mp4?t=${encodeURIComponent(tag)}`;
+            const wasPaused = vid.paused;
+            vid.src = url;
+            await vid.play().catch(()=>{});
+            if (wasPaused) vid.pause();
+            // if activity already started, attempt to hide preview soon
+            if(activityStarted){
+                setTimeout(()=>hidePreview(), 200);
+            }
+        }
+    }catch(e){}
 }
 
-setInterval(refreshIfChanged, 250);
+setInterval(refreshIfChanged, 350);
 refreshIfChanged();
 loadImages();
+setupPads();
 </script>
 """
 
