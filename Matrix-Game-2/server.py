@@ -14,7 +14,7 @@ APP = FastAPI()
 # ---------------------------
 ROOT_DIR       = os.environ.get("MG2_REPO_DIR", "/workspace/Matrix/Matrix-Game-2")
 IMAGES_DIR     = os.environ.get("MG2_IMAGES_DIR", os.path.join(ROOT_DIR, "images"))
-OUTPUT_DIR     = os.environ.get("MG2_OUTPUT_DIR", os.path.join(ROOT_DIR, "outputs/universal_run"))
+OUTPUT_DIR     = os.environ.get("MG2_OUTPUT_DIR", os.path.join(ROOT_DIR, "outputs"))
 CONFIG_PATH    = os.environ.get("MG2_CONFIG", "configs/inference_yaml/inference_universal.yaml")
 CKPT_PATH      = os.environ.get("MG2_CKPT", "Matrix-Game-2.0/base_distilled_model/base_distill.safetensors")
 PRETRAIN_DIR   = os.environ.get("MG2_PRE", "Matrix-Game-2.0")
@@ -117,20 +117,9 @@ def _writer_thread(p: subprocess.Popen):
         # 1) If the child is asking for an image path, immediately send our current one
         with io_lock:
             awaiting_img = _await_image
-            cur_img = _current_image_path
         if awaiting_img:
-            # validate the path and send the absolute path
-            try:
-                abs_img = str(pathlib.Path(cur_img).resolve())
-                if not _within(IMAGES_DIR, abs_img) or not os.path.exists(abs_img):
-                    _LOGS.append(f"[server] Image not found or outside IMAGES_DIR: {abs_img}")
-                else:
-                    _send_line(p, abs_img)
-            finally:
-                with io_lock:
-                    _await_image = False
-            # loop to catch subsequent prompts quickly
-            time.sleep(0.01)
+            # Await explicit user selection via /choose endpoint.
+            time.sleep(0.05)
             continue
 
         # 2) Otherwise, pull control commands from the queue (mouse, move)
@@ -392,6 +381,7 @@ const sel = document.getElementById('sel');
 let lastTag = null;
 let currentImg = null;
 let activityStarted = false; // true once user looks or moves
+let awaitingImage = false;   // true when child process is asking for an image path
 
 // Lightweight helpers
 function showPreview(url){
@@ -450,7 +440,10 @@ async function loadImages(){
         img.src = it.thumb;
         img.title = it.name;
         img.setAttribute('data-name', it.name);
-        img.onclick = () => restart(it.path);
+        img.onclick = () => {
+            if (awaitingImage) chooseImage(it.name);
+            else restart(it.path);
+        };
         wrap.appendChild(img);
         const cap = document.createElement('div');
         cap.className = 'thumb-name';
@@ -465,6 +458,19 @@ async function loadImages(){
         const url = `/image?name=${encodeURIComponent(currentImg)}`;
         showPreview(url);
     }
+}
+
+async function chooseImage(name){
+    try{
+        const r = await fetch('/choose',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+        const j = await r.json();
+        if(j.ok){
+            currentImg = j.image;
+            updateSel();
+            const url = `/image?name=${encodeURIComponent(currentImg)}`;
+            showPreview(url);
+        }
+    }catch(e){}
 }
 
 // Wire gamepad clicks
@@ -508,9 +514,17 @@ async function refreshIfChanged(){
     try{
         const r = await fetch('/meta');
         const j = await r.json();
-        if(!j.exists){ statusEl.textContent='Waiting for first clip…'; return; }
+        awaitingImage = !!j.awaiting_image;
+        if (awaitingImage) {
+            statusEl.textContent = 'Awaiting image selection — click an image in the gallery to start';
+        } else if (!j.exists){
+            statusEl.textContent='Waiting for first clip…';
+            return;
+        }
         const tag = `${j.mtime}-${j.size}`;
-        statusEl.textContent = `Current: ${j.path}  |  size: ${j.size}  |  mtime: ${new Date(j.mtime*1000).toLocaleTimeString()}`;
+        if(!awaitingImage){
+            statusEl.textContent = `Current: ${j.path}  |  size: ${j.size}  |  mtime: ${new Date(j.mtime*1000).toLocaleTimeString()}`;
+        }
         if(tag !== lastTag){
             lastTag = tag;
             const url = `/current.mp4?t=${encodeURIComponent(tag)}`;
@@ -650,17 +664,46 @@ async def cmd_endpoint(req: Request):
     return JSONResponse({"ok": True, "mouse": mouse, "move": move})
 
 
+# --- Explicit choose image when child prompts ---
+@APP.post("/choose")
+async def choose_image(req: Request):
+    global _current_image_path, _await_image
+    body = await req.json()
+    img_name = body.get("name")
+    if not img_name:
+        raise HTTPException(400, "Missing 'name'")
+    path = str(pathlib.Path(IMAGES_DIR, img_name).resolve())
+    if not _within(IMAGES_DIR, path) or not os.path.exists(path):
+        raise HTTPException(404, "Image not found")
+    with proc_lock:
+        p = proc
+    if not p or p.poll() is not None:
+        raise HTTPException(400, "Process not running")
+    # Send absolute path with newline and clear awaiting flag
+    _current_image_path = path
+    _send_line(p, path)
+    with io_lock:
+        _await_image = False
+    return JSONResponse({"ok": True, "image": os.path.basename(path)})
+
+
 # --- MP4 metadata & streaming with HTTP Range ---
 
 def _meta_payload():
     p = _current_mp4_path()
     if not p or not os.path.exists(p):
-        return {"exists": False}
+        return {
+            "exists": False,
+            "awaiting_image": _await_image,
+            "selected_image": os.path.basename(_current_image_path) if _within(IMAGES_DIR, _current_image_path) else None,
+        }
     return {
         "exists": True,
         "path": os.path.basename(p),
         "mtime": os.path.getmtime(p),
         "size": os.path.getsize(p),
+        "awaiting_image": _await_image,
+        "selected_image": os.path.basename(_current_image_path) if _within(IMAGES_DIR, _current_image_path) else None,
     }
 
 
