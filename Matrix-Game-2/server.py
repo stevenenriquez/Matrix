@@ -37,7 +37,6 @@ proc_lock = threading.Lock()
 _in_q: "queue.Queue[Tuple[str, str] | str]" = queue.Queue()
 _ready_mouse = False
 _ready_move  = False
-_started     = False
 io_lock = threading.Lock()
 
 # logs buffer
@@ -46,14 +45,20 @@ _LOGS = deque(maxlen=400)
 # current image in use
 _current_image_path = os.environ.get("MG2_IMG_PATH", os.path.join(IMAGES_DIR, "image.png"))
 
+
 def _within(base: str, path: str) -> bool:
-    base = str(pathlib.Path(base).resolve())
-    path = str(pathlib.Path(path).resolve())
-    return os.path.commonpath([base]) == os.path.commonpath([base, path])
+    """Return True if path is inside base (after resolving)."""
+    base_p = pathlib.Path(base).resolve()
+    path_p = pathlib.Path(path).resolve()
+    try:
+        return base_p == pathlib.Path(os.path.commonpath([base_p, path_p]))
+    except Exception:
+        return False
+
 
 def _build_cmd(img_path: str) -> List[str]:
     return [
-        sys.executable, "-u", "inference_streaming.py",
+        sys.executable, "-u", "inference_streaming.py",  # -u: unbuffered stdout/stderr
         "--config_path", CONFIG_PATH,
         "--checkpoint_path", CKPT_PATH,
         "--output_folder", OUTPUT_DIR,
@@ -62,10 +67,10 @@ def _build_cmd(img_path: str) -> List[str]:
         "--img_path", img_path,  # avoid prompt
     ]
 
+
 def _reader_thread(p: subprocess.Popen):
-    global _ready_mouse, _ready_move, _started
-    _started = False
-    for line in p.stdout:
+    global _ready_mouse, _ready_move
+    for line in p.stdout:  # type: ignore[arg-type]
         s = line.rstrip()
         _LOGS.append(s)
         print("[MG2]", s, flush=True)
@@ -77,13 +82,14 @@ def _reader_thread(p: subprocess.Popen):
             with io_lock:
                 _ready_move = True
 
+
 def _writer_thread(p: subprocess.Popen):
     global _ready_mouse, _ready_move
     while True:
         item = _in_q.get()
         if item == "STOP":
             break
-        mouse, move = item
+        mouse, move = item  # type: ignore[misc]
         # wait for mouse prompt
         while True:
             with io_lock:
@@ -106,8 +112,10 @@ def _writer_thread(p: subprocess.Popen):
         with io_lock:
             _ready_move = False
 
+
 reader_t: Optional[threading.Thread] = None
 writer_t: Optional[threading.Thread] = None
+
 
 def _stop_proc():
     global proc, reader_t, writer_t, _ready_mouse, _ready_move
@@ -127,8 +135,11 @@ def _stop_proc():
         _ready_mouse = False
         _ready_move  = False
     while not _in_q.empty():
-        try: _in_q.get_nowait()
-        except Exception: break
+        try:
+            _in_q.get_nowait()
+        except Exception:
+            break
+
 
 def _start_proc(img_path: str):
     global proc, reader_t, writer_t, _current_image_path
@@ -140,22 +151,19 @@ def _start_proc(img_path: str):
         p = subprocess.Popen(
             cmd, cwd=ROOT_DIR,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            bufsize=1, universal_newlines=True,
+            bufsize=1, text=True,  # line-buffered text I/O
         )
         proc = p
     _current_image_path = img_path
 
     # spawn fresh I/O threads bound to this proc
-    def spawn_reader():
-        _reader_thread(p)
-    def spawn_writer():
-        _writer_thread(p)
-    rt = threading.Thread(target=spawn_reader, daemon=True)
-    wt = threading.Thread(target=spawn_writer, daemon=True)
+    rt = threading.Thread(target=lambda: _reader_thread(p), daemon=True)
+    wt = threading.Thread(target=lambda: _writer_thread(p), daemon=True)
     rt.start(); wt.start()
     # record handles
     globals()['reader_t'] = rt
     globals()['writer_t'] = wt
+
 
 # start initially
 if os.path.exists(_current_image_path):
@@ -166,6 +174,7 @@ else:
 # ---------------------------
 # Helpers for mp4 serving
 # ---------------------------
+
 def _latest_mp4() -> Optional[str]:
     # Prefer *_current.mp4; fallback to any mp4
     mp4s = glob.glob(os.path.join(OUTPUT_DIR, "**", "*_current.mp4"), recursive=True)
@@ -176,25 +185,27 @@ def _latest_mp4() -> Optional[str]:
     mp4s.sort(key=lambda p: os.path.getmtime(p))
     return mp4s[-1]
 
+
 def _current_mp4_path() -> Optional[str]:
     return _latest_mp4()
+
 
 # ---------------------------
 # UI (index) with gallery
 # ---------------------------
-INDEX_HTML = f"""
+INDEX_HTML = """
 <!doctype html>
 <title>Matrix-Game 2.0 — Live Control</title>
 <style>
-  body{{font-family:system-ui,sans-serif;margin:1rem}}
-  .row{{display:flex;gap:.5rem;margin:.5rem 0;flex-wrap:wrap;align-items:center}}
-  button{{padding:.5rem .75rem;font-size:1rem}}
-  video{{max-width:100%;border:1px solid #ccc;border-radius:8px}}
-  img.thumb{{width:144px;height:96px;object-fit:cover;border-radius:8px;border:1px solid #ccc;cursor:pointer}}
-  .muted{{color:#666;font-size:.9rem}}
-  .grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(156px,1fr));gap:.75rem}}
-  .card{{display:flex;flex-direction:column;gap:.25rem;align-items:center}}
-  .sel{{border:2px solid #0a84ff !important}}
+  body{font-family:system-ui,sans-serif;margin:1rem}
+  .row{display:flex;gap:.5rem;margin:.5rem 0;flex-wrap:wrap;align-items:center}
+  button{padding:.5rem .75rem;font-size:1rem}
+  video{max-width:100%;border:1px solid #ccc;border-radius:8px}
+  img.thumb{width:144px;height:96px;object-fit:cover;border-radius:8px;border:1px solid #ccc;cursor:pointer}
+  .muted{color:#666;font-size:.9rem}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(156px,1fr));gap:.75rem}
+  .card{display:flex;flex-direction:column;gap:.25rem;align-items:center}
+  .sel{border:2px solid #0a84ff !important}
 </style>
 
 <h1>Matrix-Game 2.0 — Live Control</h1>
@@ -226,37 +237,37 @@ const sel = document.getElementById('sel');
 let lastTag = null;
 let currentImg = null;
 
-async function sendCmd(){{
+async function sendCmd(){
   const mouse=document.getElementById('mouse').value;
   const move=document.getElementById('move').value;
-  await fetch('/cmd',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{mouse,move}})}});
-}}
+  await fetch('/cmd',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mouse,move})});
+}
 
-async function restart(imgPath){{
+async function restart(imgPath){
   // If imgPath omitted, reuse current
-  const body = imgPath ? {{img: imgPath, purge:true}} : {{purge:false}};
-  const r = await fetch('/restart',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}});
+  const body = imgPath ? {img: imgPath, purge:true} : {purge:false};
+  const r = await fetch('/restart',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const j = await r.json();
-  if(j.ok){{
+  if(j.ok){
     currentImg = j.image;
     updateSel();
     lastTag = null; // force video reload on next /meta tick
-  }}
-}}
+  }
+}
 
-function updateSel(){{
+function updateSel(){
   sel.textContent = currentImg ? ('Selected: ' + currentImg) : '';
-  document.querySelectorAll('.thumb').forEach(el=>{{
+  document.querySelectorAll('.thumb').forEach(el=>{
     if(currentImg && el.getAttribute('data-name')===currentImg) el.classList.add('sel');
     else el.classList.remove('sel');
-  }});
-}}
+  });
+}
 
-async function loadImages(){{
+async function loadImages(){
   const r = await fetch('/images');
   const j = await r.json();
   gallery.innerHTML = '';
-  j.items.forEach(it => {{
+  j.items.forEach(it => {
     const card = document.createElement('div');
     card.className = 'card';
     const img = document.createElement('img');
@@ -270,29 +281,29 @@ async function loadImages(){{
     cap.textContent = it.name;
     card.appendChild(img); card.appendChild(cap);
     gallery.appendChild(card);
-  }});
+  });
   currentImg = j.selected || null;
   updateSel();
-}}
+}
 
 // Poll for new 1s clip; reload <video> when mtime/size changes
-async function refreshIfChanged(){{
-  try{{
+async function refreshIfChanged(){
+  try{
     const r = await fetch('/meta');
     const j = await r.json();
-    if(!j.exists){{ statusEl.textContent='Waiting for first clip…'; return; }}
-    const tag = `${{j.mtime}}-${{j.size}}`;
-    statusEl.textContent = `Current: ${{j.path}}  |  size: ${{j.size}}  |  mtime: ${{new Date(j.mtime*1000).toLocaleTimeString()}}`;
-    if(tag !== lastTag){{
+    if(!j.exists){ statusEl.textContent='Waiting for first clip…'; return; }
+    const tag = `${j.mtime}-${j.size}`;
+    statusEl.textContent = `Current: ${j.path}  |  size: ${j.size}  |  mtime: ${new Date(j.mtime*1000).toLocaleTimeString()}`;
+    if(tag !== lastTag){
       lastTag = tag;
-      const url = `/current.mp4?t=${{encodeURIComponent(tag)}}`;
+      const url = `/current.mp4?t=${encodeURIComponent(tag)}`;
       const wasPaused = vid.paused;
       vid.src = url;
       await vid.play().catch(()=>{});
       if (wasPaused) vid.pause();
-    }}
-  }}catch(e){{}}
-}}
+    }
+  }catch(e){}
+}
 
 setInterval(refreshIfChanged, 250);
 refreshIfChanged();
@@ -307,9 +318,11 @@ loadImages();
 def index():
     return INDEX_HTML
 
+
 @APP.get("/favicon.ico")
 def favicon():
     return PlainTextResponse("", status_code=204)
+
 
 @APP.get("/healthz")
 def health():
@@ -318,11 +331,14 @@ def health():
     cur = _current_mp4_path()
     return {"proc_alive": alive, "latest_mp4": cur, "output_dir": OUTPUT_DIR, "image": _current_image_path}
 
+
 @APP.get("/logs")
 def logs():
     return JSONResponse({"lines": list(_LOGS)})
 
+
 # --- Images listing and thumbnails ---
+
 def _list_images() -> List[str]:
     pats = ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp"]
     files: List[str] = []
@@ -330,6 +346,7 @@ def _list_images() -> List[str]:
         files += glob.glob(os.path.join(IMAGES_DIR, pat))
     files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return files
+
 
 @APP.get("/images")
 def images():
@@ -345,6 +362,7 @@ def images():
     sel = os.path.basename(_current_image_path) if _within(IMAGES_DIR, _current_image_path) else None
     return {"items": items, "selected": sel, "dir": IMAGES_DIR}
 
+
 @APP.get("/image")
 def image(name: str = Query(...)):
     path = str(pathlib.Path(IMAGES_DIR, name).resolve())
@@ -354,6 +372,7 @@ def image(name: str = Query(...)):
         data = f.read()
     # naive content-type; browser only needs it for viewing
     return Response(content=data, media_type="image/*", headers={"Cache-Control": "no-store"})
+
 
 @APP.get("/thumb")
 def thumb(name: str = Query(...), w: int = 256, h: int = 160):
@@ -368,6 +387,7 @@ def thumb(name: str = Query(...), w: int = 256, h: int = 160):
         return Response(content=bio.getvalue(), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
     except Exception:
         raise HTTPException(500)
+
 
 # --- Restart with (optional) new image ---
 @APP.post("/restart")
@@ -397,6 +417,7 @@ async def restart(req: Request):
     _start_proc(_current_image_path)
     return JSONResponse({"ok": True, "image": os.path.basename(_current_image_path)})
 
+
 # --- Control commands ---
 @APP.post("/cmd")
 async def cmd_endpoint(req: Request):
@@ -406,7 +427,9 @@ async def cmd_endpoint(req: Request):
     _in_q.put((mouse, move))
     return JSONResponse({"ok": True, "mouse": mouse, "move": move})
 
+
 # --- MP4 metadata & streaming with HTTP Range ---
+
 def _meta_payload():
     p = _current_mp4_path()
     if not p or not os.path.exists(p):
@@ -418,9 +441,11 @@ def _meta_payload():
         "size": os.path.getsize(p),
     }
 
+
 @APP.get("/meta")
 def meta():
     return _meta_payload()
+
 
 @APP.get("/current.mp4")
 def current_mp4(range: str | None = Header(default=None)):
