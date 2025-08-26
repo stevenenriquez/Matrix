@@ -37,6 +37,7 @@ proc_lock = threading.Lock()
 _in_q: "queue.Queue[Tuple[str, str] | str]" = queue.Queue()
 _ready_mouse = False
 _ready_move  = False
+_await_image = False
 io_lock = threading.Lock()
 
 # logs buffer
@@ -44,6 +45,12 @@ _LOGS = deque(maxlen=400)
 
 # current image in use
 _current_image_path = os.environ.get("MG2_IMG_PATH", os.path.join(IMAGES_DIR, "image.png"))
+
+# heuristics to detect the image-path prompt from the subprocess
+_IMG_PROMPT_TOKENS = [
+    "input the image path", "image path:", "please input the image",
+    "please input image", "enter image path", "path of the image",
+]
 
 
 def _within(base: str, path: str) -> bool:
@@ -57,6 +64,7 @@ def _within(base: str, path: str) -> bool:
 
 
 def _build_cmd(img_path: str) -> List[str]:
+    # NOTE: inference_streaming.py prompts for image path; we do NOT pass --img_path
     return [
         sys.executable, "-u", "inference_streaming.py",  # -u: unbuffered stdout/stderr
         "--config_path", CONFIG_PATH,
@@ -64,51 +72,96 @@ def _build_cmd(img_path: str) -> List[str]:
         "--output_folder", OUTPUT_DIR,
         "--seed", SEED,
         "--pretrained_model_path", PRETRAIN_DIR,
-        "--img_path", img_path,  # avoid prompt
     ]
 
 
+def _send_line(p: subprocess.Popen, text: str):
+    if p.stdin:
+        p.stdin.write(text + "
+")
+        p.stdin.flush()
+        _LOGS.append(f"[server→child] {text}")
+        print("[server→child]", text, flush=True)
+
+
 def _reader_thread(p: subprocess.Popen):
-    global _ready_mouse, _ready_move
-    for line in p.stdout:  # type: ignore[arg-type]
-        s = line.rstrip()
+    global _ready_mouse, _ready_move, _await_image
+    for raw in p.stdout:  # type: ignore[arg-type]
+        s = raw.rstrip()
         _LOGS.append(s)
         print("[MG2]", s, flush=True)
-        if "Please input the mouse action" in s:
+
+        low = s.lower()
+        if any(tok in low for tok in _IMG_PROMPT_TOKENS):
+            with io_lock:
+                _await_image = True
+                _ready_mouse = False
+                _ready_move  = False
+            continue
+
+        if "please input the mouse action" in low:
             with io_lock:
                 _ready_mouse = True
                 _ready_move  = False
-        elif "movement action" in s or "PRESS [W, S, A, D, Q]" in s:
+            continue
+
+        if ("movement action" in low) or ("press [w, s, a, d, q]" in low):
             with io_lock:
                 _ready_move = True
+            continue
 
 
 def _writer_thread(p: subprocess.Popen):
-    global _ready_mouse, _ready_move
+    global _ready_mouse, _ready_move, _await_image
     while True:
-        item = _in_q.get()
+        # 1) If the child is asking for an image path, immediately send our current one
+        with io_lock:
+            awaiting_img = _await_image
+            cur_img = _current_image_path
+        if awaiting_img:
+            # validate the path and send the absolute path
+            try:
+                abs_img = str(pathlib.Path(cur_img).resolve())
+                if not _within(IMAGES_DIR, abs_img) or not os.path.exists(abs_img):
+                    _LOGS.append(f"[server] Image not found or outside IMAGES_DIR: {abs_img}")
+                else:
+                    _send_line(p, abs_img)
+            finally:
+                with io_lock:
+                    _await_image = False
+            # loop to catch subsequent prompts quickly
+            time.sleep(0.01)
+            continue
+
+        # 2) Otherwise, pull control commands from the queue (mouse, move)
+        try:
+            item = _in_q.get(timeout=0.1)
+        except queue.Empty:
+            continue
+
         if item == "STOP":
             break
+
         mouse, move = item  # type: ignore[misc]
+
         # wait for mouse prompt
         while True:
             with io_lock:
                 if _ready_mouse:
                     break
             time.sleep(0.01)
-        if p.stdin:
-            p.stdin.write((mouse or "U") + "\n"); p.stdin.flush()
+        _send_line(p, (mouse or "U"))
         with io_lock:
             _ready_mouse = False
             _ready_move  = True
+
         # wait for move prompt
         while True:
             with io_lock:
                 if _ready_move:
                     break
             time.sleep(0.01)
-        if p.stdin:
-            p.stdin.write((move or "Q") + "\n"); p.stdin.flush()
+        _send_line(p, (move or "Q"))
         with io_lock:
             _ready_move = False
 
@@ -118,7 +171,7 @@ writer_t: Optional[threading.Thread] = None
 
 
 def _stop_proc():
-    global proc, reader_t, writer_t, _ready_mouse, _ready_move
+    global proc, reader_t, writer_t, _ready_mouse, _ready_move, _await_image
     with proc_lock:
         if proc and proc.poll() is None:
             try:
@@ -134,6 +187,7 @@ def _stop_proc():
     with io_lock:
         _ready_mouse = False
         _ready_move  = False
+        _await_image = False
     while not _in_q.empty():
         try:
             _in_q.get_nowait()
@@ -160,7 +214,6 @@ def _start_proc(img_path: str):
     rt = threading.Thread(target=lambda: _reader_thread(p), daemon=True)
     wt = threading.Thread(target=lambda: _writer_thread(p), daemon=True)
     rt.start(); wt.start()
-    # record handles
     globals()['reader_t'] = rt
     globals()['writer_t'] = wt
 
