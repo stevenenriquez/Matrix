@@ -77,7 +77,8 @@ def _build_cmd(img_path: str) -> List[str]:
 
 def _send_line(p: subprocess.Popen, text: str):
     if p.stdin:
-        p.stdin.write(text + "")
+        # Ensure a newline so the child process receives a full line and proceeds.
+        p.stdin.write(text + "\n")
         p.stdin.flush()
         _LOGS.append(f"[server→child] {text}")
         print("[server→child]", text, flush=True)
